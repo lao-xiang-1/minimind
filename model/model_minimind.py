@@ -348,7 +348,7 @@ class MOEFeedForward(nn.Module):
 
         return expert_cache
 
-def block_attn_res(blocks: list[Tensor], partial_block: Tensor, proj: Linear, norm: RMSNorm) -> Tensor:
+def block_attn_res(blocks: list[torch.Tensor], partial_block: torch.Tensor, proj: nn.Linear, norm: RMSNorm) -> torch.Tensor:
     """
     Inter-block attention: attend over block reps + partial sum.
     blocks:
@@ -361,32 +361,6 @@ def block_attn_res(blocks: list[Tensor], partial_block: Tensor, proj: Linear, no
     logits = torch.einsum('d, n b t d -> n b t', proj.weight.squeeze(), K)
     h = torch.einsum('n b t, n b t d -> b t d', logits.softmax(0), V)
     return h
-
-
-def forward(self, blocks: list[Tensor], hidden_states: Tensor) -> tuple[list[Tensor], Tensor]:
-    partial_block = hidden_states
-    # apply block attnres before attn
-    # blocks already include token embedding
-    h = block_attn_res(blocks, partial_block, self.attn_res_proj, self.attn_res_norm)
-
-    # if reaches block boundary, start new block
-    # block_size counts ATTN + MLP; each transformer layer has 2
-    if self.layer_number % (self.block_size // 2) == 0:
-        blocks.append(partial_block)
-        partial_block = None
-
-    # self-attention layer
-    attn_out = self.attn(self.attn_norm(h))
-    partial_block = partial_block + attn_out if partial_block is not None else attn_out
-
-    # apply block attnres before MLP
-    h = block_attn_res(blocks, partial_block, self.mlp_res_proj, self.mlp_res_norm)
-
-    # MLP layer
-    mlp_out = self.mlp(self.mlp_norm(h))
-    partial_block = partial_block + mlp_out
-
-    return blocks, partial_block
 
 
 class MiniMindBlock(nn.Module):
@@ -402,14 +376,49 @@ class MiniMindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        residual = hidden_states
-        hidden_states, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states), position_embeddings,
+        # block_attn_res related
+        self.layer_number = layer_id
+        self.block_size = 2 # Attention + MLP
+        self.attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
+        self.attn_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
+        self.mlp_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None, blocks=None):
+        if blocks is None:
+            blocks = []
+        partial_block = hidden_states
+        
+        # apply block attnres before attn
+        if len(blocks) > 0:
+            h = block_attn_res(blocks, partial_block, self.attn_res_proj, self.attn_res_norm)
+        else:
+            h = partial_block
+
+        # if reaches block boundary, start new block
+        if self.layer_number % (self.block_size // 2) == 0:
+            blocks.append(partial_block)
+            partial_block = torch.zeros_like(hidden_states) # initialize partial block
+
+        # self-attention layer
+        attn_out, present_key_value = self.self_attn(
+            self.input_layernorm(h), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
-        hidden_states += residual
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        partial_block = partial_block + attn_out if partial_block is not None else attn_out
+
+        # apply block attnres before MLP
+        if len(blocks) > 0:
+            h = block_attn_res(blocks, partial_block, self.mlp_res_proj, self.mlp_res_norm)
+        else:
+            h = partial_block
+
+        # MLP layer
+        mlp_out = self.mlp(self.post_attention_layernorm(h))
+        partial_block = partial_block + mlp_out
+        
+        hidden_states = partial_block
+
         return hidden_states, present_key_value
 
 
@@ -448,13 +457,15 @@ class MiniMindModel(nn.Module):
         )
 
         presents = []
+        blocks = [] # List to track inter-block representations
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
-                attention_mask=attention_mask
+                attention_mask=attention_mask,
+                blocks=blocks # Pass blocks through layers
             )
             presents.append(present)
 
@@ -501,3 +512,18 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
         return output
+
+
+if __name__ == '__main__':
+    print("Testing MiniMindModel forward pass...")
+    config = MiniMindConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        vocab_size=100
+    )
+    model = MiniMindForCausalLM(config)
+    input_ids = torch.randint(0, 100, (2, 10))
+    out = model(input_ids)
+    print("Success! Output logits shape:", out.logits.shape)
+
